@@ -2,6 +2,19 @@
 
 These patches fix Frida for Android 15 (API 35) and Android 16 (API 36) devices.
 
+## Quick Start (Easiest Method)
+
+If you already have frida-tools installed via pip:
+
+```bash
+# Download and run the patch script
+curl -O https://raw.githubusercontent.com/sijan2/frida/android16-compat-spawn/patches/patch-frida-tools.py
+python3 patch-frida-tools.py
+
+# Download pre-built server from releases
+# https://github.com/sijan2/frida/releases/tag/v17.5.2-android16
+```
+
 ## Problems Fixed
 
 ### 1. Server Crash / Device Brick (frida-core)
@@ -19,16 +32,25 @@ On Android 15/16, Frida's default spawn mechanism injects into `zygote` and `sys
 
 ### 2. Java.perform() Crash (frida-java-bridge)
 
-On Android 16, the ART runtime changed:
+On Android 16, the ART runtime changed significantly:
 - Method array headers are 8 bytes (pointer-aligned)
 - Class offsets changed (ifields=0x28, methods=0x30)
-- JNI ID indirection works differently
+- The art_api C module causes ToReflectedMethod crashes
 
-**Fix:** Added build-time patch to frida-java-bridge that:
-- Returns fixed offsets for API 36+
-- Prevents `ToReflectedMethod` / `GetFieldID` SIGSEGV crashes
+**Fix:** Three patches to java.js:
+1. `getArtClassSpec` - Returns fixed offsets for API 36
+2. `art_api` - Disabled for API 36 (uses safer reflection path)
+3. `kt()` - Properly decodes method/field IDs on API 36
 
 ## How to Apply
+
+### Option 1: Patch existing frida-tools installation
+
+```bash
+python3 patches/patch-frida-tools.py
+```
+
+### Option 2: Build from source
 
 ```bash
 # After cloning this fork:
@@ -44,6 +66,7 @@ make
 # Clone this fork
 git clone --recurse-submodules https://github.com/sijan2/frida.git
 cd frida
+git checkout android16-compat-spawn
 
 # Apply patches
 ./patches/apply-patches.sh
@@ -83,3 +106,4 @@ frida -U -f com.example.app -l script.js
 
 - `subprojects/frida-core/src/linux/linux-host-session.vala` - Compat spawn implementation
 - `subprojects/frida-tools/bridges/build.py` - Build-time Java bridge patch
+- `patches/patch-frida-tools.py` - Runtime patch for installed frida-tools
