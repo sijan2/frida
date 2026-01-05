@@ -1,0 +1,408 @@
+diff --git a/src/linux/linux-host-session.vala b/src/linux/linux-host-session.vala
+index 173e43f..acde8b3 100644
+--- a/src/linux/linux-host-session.vala
++++ b/src/linux/linux-host-session.vala
+@@ -34,8 +34,22 @@ namespace Frida {
+ 
+ #if ANDROID
+ 		private RoboLauncher robo_launcher;
+-		internal SystemServerAgent system_server_agent;
++		internal SystemServerAgent? system_server_agent;
+ 		private CrashMonitor? crash_monitor;
++		private uint android_api_level = 0;
++		internal bool android_system_server_agent_enabled {
++			get;
++			private set;
++		}
++		internal bool android_zygote_injection_enabled {
++			get;
++			private set;
++		}
++		internal bool android_spawn_support_enabled {
++			get;
++			private set;
++		}
++		private Gee.HashSet<uint> compat_spawn_pids = new Gee.HashSet<uint> ();
+ #endif
+ 
+ #if !ANDROID
+@@ -74,8 +88,12 @@ namespace Frida {
+ #endif
+ 
+ #if ANDROID
+-			system_server_agent = new SystemServerAgent (this);
+-			system_server_agent.unloaded.connect (on_system_server_agent_unloaded);
++			configure_android_injection_policy ();
++
++			if (android_system_server_agent_enabled) {
++				system_server_agent = new SystemServerAgent (this);
++				system_server_agent.unloaded.connect (on_system_server_agent_unloaded);
++			}
+ 
+ 			robo_launcher = new RoboLauncher (this, io_cancellable);
+ 			robo_launcher.spawn_added.connect (on_robo_launcher_spawn_added);
+@@ -88,11 +106,63 @@ namespace Frida {
+ #endif
+ 		}
+ 
++#if ANDROID
++		private void configure_android_injection_policy () {
++			android_api_level = read_android_api_level ();
++			bool default_enabled = android_api_level > 0 && android_api_level < 35;
++
++			android_system_server_agent_enabled = get_android_feature_flag (
++				"FRIDA_ANDROID_SYSTEM_SERVER_AGENT",
++				default_enabled
++			);
++			android_zygote_injection_enabled = get_android_feature_flag (
++				"FRIDA_ANDROID_ZYGOTE_INJECTION",
++				default_enabled
++			);
++			android_spawn_support_enabled = android_system_server_agent_enabled && android_zygote_injection_enabled;
++		}
++
++		private static bool get_android_feature_flag (string name, bool default_value) {
++			string? value = Environment.get_variable (name);
++			if (value == null)
++				return default_value;
++
++			value = value.strip ().down ();
++			if (value == "1" || value == "true" || value == "yes")
++				return true;
++			if (value == "0" || value == "false" || value == "no")
++				return false;
++
++			return default_value;
++		}
++
++		private static uint read_android_api_level () {
++			try {
++				string output;
++				string error_output;
++				int status;
++
++				if (GLib.Process.spawn_command_line_sync ("getprop ro.build.version.sdk", out output, out error_output, out status)) {
++					if (status == 0) {
++						output = output.strip ();
++						if (output.length > 0)
++							return (uint) int.parse (output);
++					}
++				}
++			} catch (SpawnError e) {
++			}
++
++			return 0;
++		}
++#endif
++
+ 		public override async void preload (Cancellable? cancellable) throws Error, IOError {
+ #if ANDROID
+-			yield system_server_agent.preload (cancellable);
++			if (android_system_server_agent_enabled && system_server_agent != null)
++				yield system_server_agent.preload (cancellable);
+ 
+-			yield robo_launcher.preload (cancellable);
++			if (android_spawn_support_enabled)
++				yield robo_launcher.preload (cancellable);
+ #endif
+ 		}
+ 
+@@ -102,8 +172,10 @@ namespace Frida {
+ 			robo_launcher.spawn_added.disconnect (on_robo_launcher_spawn_added);
+ 			robo_launcher.spawn_removed.disconnect (on_robo_launcher_spawn_removed);
+ 
+-			system_server_agent.unloaded.disconnect (on_system_server_agent_unloaded);
+-			yield system_server_agent.close (cancellable);
++			if (android_system_server_agent_enabled && system_server_agent != null) {
++				system_server_agent.unloaded.disconnect (on_system_server_agent_unloaded);
++				yield system_server_agent.close (cancellable);
++			}
+ #endif
+ 
+ 			yield base.close (cancellable);
+@@ -168,6 +240,8 @@ namespace Frida {
+ 				Cancellable? cancellable) throws Error, IOError {
+ 			var opts = FrontmostQueryOptions._deserialize (options);
+ #if ANDROID
++			if (!android_system_server_agent_enabled || system_server_agent == null)
++				return HostApplicationInfo.empty ();
+ 			var app = yield system_server_agent.get_frontmost_application (opts, cancellable);
+ 			if (app.pid == 0)
+ 				return app;
+@@ -194,6 +268,8 @@ namespace Frida {
+ 				Cancellable? cancellable) throws Error, IOError {
+ 			var opts = ApplicationQueryOptions._deserialize (options);
+ #if ANDROID
++			if (!android_system_server_agent_enabled || system_server_agent == null)
++				return new HostApplicationInfo[0];
+ 			var apps = yield system_server_agent.enumerate_applications (opts, cancellable);
+ 
+ 			if (opts.scope != MINIMAL) {
+@@ -244,26 +320,28 @@ namespace Frida {
+ 			var processes = yield process_enumerator.enumerate_processes (opts);
+ 
+ #if ANDROID
+-			var process_index_by_pid = new Gee.HashMap<uint, uint> ();
+-			int i = 0;
+-			foreach (var process in processes)
+-				process_index_by_pid[process.pid] = i++;
++			if (android_system_server_agent_enabled && system_server_agent != null) {
++				var process_index_by_pid = new Gee.HashMap<uint, uint> ();
++				int i = 0;
++				foreach (var process in processes)
++					process_index_by_pid[process.pid] = i++;
+ 
+-			var extra = yield system_server_agent.get_process_parameters (process_index_by_pid.keys.to_array (), opts.scope,
+-				cancellable);
++				var extra = yield system_server_agent.get_process_parameters (process_index_by_pid.keys.to_array (), opts.scope,
++					cancellable);
+ 
+-			foreach (var entry in extra.entries) {
+-				uint pid = entry.key;
+-				HashTable<string, Variant> extra_parameters = entry.value;
+-
+-				uint index = process_index_by_pid[pid];
+-				HashTable<string, Variant> parameters = processes[index].parameters;
+-				extra_parameters.foreach ((key, val) => {
+-					if (key == "$name")
+-						processes[index].name = val.get_string ();
+-					else
+-						parameters[key] = val;
+-				});
++				foreach (var entry in extra.entries) {
++					uint pid = entry.key;
++					HashTable<string, Variant> extra_parameters = entry.value;
++
++					uint index = process_index_by_pid[pid];
++					HashTable<string, Variant> parameters = processes[index].parameters;
++					extra_parameters.foreach ((key, val) => {
++						if (key == "$name")
++							processes[index].name = val.get_string ();
++						else
++							parameters[key] = val;
++					});
++				}
+ 			}
+ #endif
+ 
+@@ -272,6 +350,8 @@ namespace Frida {
+ 
+ 		public override async void enable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
+ #if ANDROID
++			if (!android_spawn_support_enabled)
++				throw new Error.NOT_SUPPORTED ("Spawn gating is disabled on Android 15/16. Set FRIDA_ANDROID_ZYGOTE_INJECTION=1 and FRIDA_ANDROID_SYSTEM_SERVER_AGENT=1 to override.");
+ 			yield robo_launcher.enable_spawn_gating (cancellable);
+ #else
+ 			throw new Error.NOT_SUPPORTED ("Not yet supported on this OS");
+@@ -280,6 +360,8 @@ namespace Frida {
+ 
+ 		public override async void disable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
+ #if ANDROID
++			if (!android_spawn_support_enabled)
++				throw new Error.NOT_SUPPORTED ("Spawn gating is disabled on Android 15/16. Set FRIDA_ANDROID_ZYGOTE_INJECTION=1 and FRIDA_ANDROID_SYSTEM_SERVER_AGENT=1 to override.");
+ 			yield robo_launcher.disable_spawn_gating (cancellable);
+ #else
+ 			throw new Error.NOT_SUPPORTED ("Not yet supported on this OS");
+@@ -288,6 +370,8 @@ namespace Frida {
+ 
+ 		public override async HostSpawnInfo[] enumerate_pending_spawn (Cancellable? cancellable) throws Error, IOError {
+ #if ANDROID
++			if (!android_spawn_support_enabled)
++				return new HostSpawnInfo[0];
+ 			return robo_launcher.enumerate_pending_spawn ();
+ #else
+ 			throw new Error.NOT_SUPPORTED ("Not yet supported on this OS");
+@@ -297,8 +381,11 @@ namespace Frida {
+ 		public override async uint spawn (string program, HostSpawnOptions options, Cancellable? cancellable)
+ 				throws Error, IOError {
+ #if ANDROID
+-			if (!program.has_prefix ("/"))
++			if (!program.has_prefix ("/")) {
++				if (!android_spawn_support_enabled)
++					return yield spawn_android_compat (program, options, cancellable);
+ 				return yield robo_launcher.spawn (program, options, cancellable);
++			}
+ #endif
+ 
+ 			return yield helper.spawn (program, options, cancellable);
+@@ -306,6 +393,8 @@ namespace Frida {
+ 
+ 		protected override bool try_handle_child (HostChildInfo info) {
+ #if ANDROID
++			if (!android_spawn_support_enabled)
++				return false;
+ 			return robo_launcher.try_handle_child (info);
+ #else
+ 			return false;
+@@ -314,12 +403,16 @@ namespace Frida {
+ 
+ 		protected override void notify_child_resumed (uint pid) {
+ #if ANDROID
++			if (!android_spawn_support_enabled)
++				return;
+ 			robo_launcher.notify_child_resumed (pid);
+ #endif
+ 		}
+ 
+ 		protected override void notify_child_gating_changed (uint pid, uint subscriber_count) {
+ #if ANDROID
++			if (!android_spawn_support_enabled)
++				return;
+ 			robo_launcher.notify_child_gating_changed (pid, subscriber_count);
+ #endif
+ 		}
+@@ -345,13 +438,97 @@ namespace Frida {
+ 		}
+ 
+ 		protected override async void perform_resume (uint pid, Cancellable? cancellable) throws Error, IOError {
++#if ANDROID
++			if (compat_spawn_pids.remove (pid)) {
++				Posix.kill ((Posix.pid_t) pid, Posix.Signal.CONT);
++				return;
++			}
++#endif
+ 			yield helper.resume (pid, cancellable);
+ 		}
+ 
++#if ANDROID
++		private async uint spawn_android_compat (string package, HostSpawnOptions options, Cancellable? cancellable)
++				throws Error, IOError {
++			if (options.has_argv)
++				throw new Error.NOT_SUPPORTED ("The 'argv' option is not supported when spawning Android apps");
++
++			if (options.has_envp)
++				throw new Error.NOT_SUPPORTED ("The 'envp' option is not supported when spawning Android apps");
++
++			if (options.has_env)
++				throw new Error.NOT_SUPPORTED ("The 'env' option is not supported when spawning Android apps");
++
++			if (options.cwd.length > 0)
++				throw new Error.NOT_SUPPORTED ("The 'cwd' option is not supported when spawning Android apps");
++
++			if (options.stdio != INHERIT)
++				throw new Error.NOT_SUPPORTED ("Redirected stdio is not supported when spawning Android apps");
++
++			var entrypoint = PackageEntrypoint.parse (package, options);
++
++			string output;
++			string error_output;
++			int status;
++
++			GLib.Process.spawn_command_line_sync ("/system/bin/am force-stop " + package,
++				out output, out error_output, out status);
++
++			string start_cmd;
++			if (entrypoint is DefaultActivityEntrypoint) {
++				start_cmd = "/system/bin/monkey -p " + package + " -c android.intent.category.LAUNCHER 1";
++			} else if (entrypoint is ActivityEntrypoint) {
++				var e = entrypoint as ActivityEntrypoint;
++				start_cmd = "/system/bin/am start -n " + package + "/" + e.activity;
++			} else if (entrypoint is BroadcastReceiverEntrypoint) {
++				var e = entrypoint as BroadcastReceiverEntrypoint;
++				start_cmd = "/system/bin/am broadcast -a " + e.action + " -n " + package + "/" + e.receiver;
++			} else {
++				assert_not_reached ();
++			}
++
++			GLib.Process.spawn_command_line_sync (start_cmd, out output, out error_output, out status);
++
++			var request = new Promise<uint> ();
++
++			var timeout = new TimeoutSource.seconds (20);
++			timeout.set_callback (() => {
++				request.reject (new Error.TIMED_OUT ("Unexpectedly timed out while waiting for app to launch"));
++				return false;
++			});
++			timeout.attach (MainContext.get_thread_default ());
++
++			var poll = new TimeoutSource (200);
++			poll.set_callback (() => {
++				uint pid = LocalProcesses.find_pid (package);
++				if (pid != 0) {
++					request.resolve (pid);
++					return false;
++				}
++				return true;
++			});
++			poll.attach (MainContext.get_thread_default ());
++
++			uint pid = 0;
++			try {
++				pid = yield request.future.wait_async (cancellable);
++			} finally {
++				timeout.destroy ();
++				poll.destroy ();
++			}
++
++			compat_spawn_pids.add (pid);
++
++			return pid;
++		}
++#endif
++
+ 		public override async void kill (uint pid, Cancellable? cancellable) throws Error, IOError {
+ #if ANDROID
+-			if (yield system_server_agent.try_stop_package_by_pid (pid, cancellable))
+-				return;
++			if (android_system_server_agent_enabled && system_server_agent != null) {
++				if (yield system_server_agent.try_stop_package_by_pid (pid, cancellable))
++					return;
++			}
+ #endif
+ 
+ 			yield helper.kill (pid, cancellable);
+@@ -403,6 +580,9 @@ namespace Frida {
+ 
+ #if ANDROID
+ 		private void on_system_server_agent_unloaded (InternalAgent dead_agent) {
++			if (!android_system_server_agent_enabled)
++				return;
++
+ 			dead_agent.unloaded.disconnect (on_system_server_agent_unloaded);
+ 
+ 			system_server_agent = new SystemServerAgent (this);
+@@ -521,6 +701,9 @@ namespace Frida {
+ 		}
+ 
+ 		public async uint spawn (string program, HostSpawnOptions options, Cancellable? cancellable) throws Error, IOError {
++			if (!host_session.android_spawn_support_enabled || host_session.system_server_agent == null)
++				throw new Error.NOT_SUPPORTED ("App spawning is disabled on Android 15/16. Set FRIDA_ANDROID_ZYGOTE_INJECTION=1 and FRIDA_ANDROID_SYSTEM_SERVER_AGENT=1 to override.");
++
+ 			string package = program;
+ 
+ 			if (options.has_argv)
+@@ -543,6 +726,8 @@ namespace Frida {
+ 			yield ensure_loaded (cancellable);
+ 
+ 			var system_server_agent = host_session.system_server_agent;
++			if (system_server_agent == null)
++				throw new Error.NOT_SUPPORTED ("App spawning is disabled on Android 15/16. Set FRIDA_ANDROID_ZYGOTE_INJECTION=1 and FRIDA_ANDROID_SYSTEM_SERVER_AGENT=1 to override.");
+ 
+ 			var process_name = yield system_server_agent.get_process_name (package, entrypoint.uid, cancellable);
+ 
+@@ -661,15 +846,17 @@ namespace Frida {
+ 				}
+ 			};
+ 
+-			foreach (HostProcessInfo info in System.enumerate_processes (new ProcessQueryOptions ())) {
+-				var name = info.name;
+-				if (name == "zygote" || name == "zygote64" || name == "usap32" || name == "usap64") {
+-					uint pid = info.pid;
+-					if (zygote_agents.has_key (pid))
+-						continue;
++			if (host_session.android_zygote_injection_enabled) {
++				foreach (HostProcessInfo info in System.enumerate_processes (new ProcessQueryOptions ())) {
++					var name = info.name;
++					if (name == "zygote" || name == "zygote64" || name == "usap32" || name == "usap64") {
++						uint pid = info.pid;
++						if (zygote_agents.has_key (pid))
++							continue;
+ 
+-					pending++;
+-					do_inject_zygote_agent.begin (pid, name, cancellable, on_complete);
++						pending++;
++						do_inject_zygote_agent.begin (pid, name, cancellable, on_complete);
++					}
+ 				}
+ 			}
+ 

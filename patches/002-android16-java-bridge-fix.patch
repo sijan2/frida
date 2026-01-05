@@ -1,0 +1,30 @@
+diff --git a/bridges/build.py b/bridges/build.py
+index 7b87dc5..e720003 100644
+--- a/bridges/build.py
++++ b/bridges/build.py
+@@ -42,6 +42,25 @@ def compile_bridges(inputs: List[Path], output_dir: Path, priv_dir: Path, npm: P
+     }
+ 
+     subprocess.run([npm, "install"], **run_kwargs)
++
++    # PATCH: Add Android 16 (API 36) ART offset fix to frida-java-bridge
++    def patch_frida_java_bridge():
++        android_js = priv_dir / "node_modules" / "frida-java-bridge" / "lib" / "android.js"
++        if not android_js.exists():
++            return
++        src = android_js.read_text(encoding="utf-8")
++        old = "export function getArtClassSpec (vm) {\n  const MAX_OFFSET = 0x100;"
++        new = ("export function getArtClassSpec (vm) {\n"
++               "  if (getAndroidApiLevel() >= 36) {\n"
++               "    return { offset: { ifields: 0x28, methods: 0x30, sfields: 0, copiedMethodsOffset: 0x6c } };\n"
++               "  }\n"
++               "  const MAX_OFFSET = 0x100;")
++        if old in src:
++            android_js.write_text(src.replace(old, new), encoding="utf-8")
++            print("[PATCH] Applied Android 16 ART offset fix to frida-java-bridge")
++
++    patch_frida_java_bridge()
++
+     subprocess.run([npm, "run", "build"], **run_kwargs)
+ 
+     for outname in [p.stem + ".js" for p in inputs if p.stem != "rollup.config" and p.suffix == ".ts"]:
