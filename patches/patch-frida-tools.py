@@ -43,16 +43,29 @@ def main():
     changes = 0
 
     # Patch 1: Fix getArtClassSpec (He) to return proper offsets for API 36
-    old1 = 'function He(e){if(be()>=36){return null;}'
-    new1 = 'function He(e){if(be()>=36){return{offset:{ifields:40,methods:48,sfields:0,copiedMethodsOffset:108}};}'
-    if old1 in src:
-        src = src.replace(old1, new1)
-        print("[+] Fixed He() - getArtClassSpec returns proper offsets for API 36")
+    # Handle both vanilla and previously modified versions
+
+    # Check if already patched with correct fix
+    if 'He(e){if(be()>=36){return{offset:' in src:
+        print("[*] He() already patched correctly")
+    # Fix version that returns null for API 36
+    elif 'function He(e){if(be()>=36){return null;}' in src:
+        src = src.replace(
+            'function He(e){if(be()>=36){return null;}',
+            'function He(e){if(be()>=36){return{offset:{ifields:40,methods:48,sfields:0,copiedMethodsOffset:108}};}'
+        )
+        print("[+] Fixed He() - changed null return to proper offsets for API 36")
         changes += 1
-    elif 'He(e){if(be()>=36){return{offset:' in src:
-        print("[*] He() already patched")
+    # Vanilla version - add API 36 check
+    elif 'function He(e){let t=null;return e.perform' in src:
+        src = src.replace(
+            'function He(e){let t=null;return e.perform',
+            'function He(e){if(be()>=36){return{offset:{ifields:40,methods:48,sfields:0,copiedMethodsOffset:108}};}let t=null;return e.perform'
+        )
+        print("[+] Fixed He() - added API 36 early return with proper offsets")
+        changes += 1
     else:
-        print("[!] Could not find He() pattern")
+        print("[!] Could not find He() pattern - unknown frida-tools version")
 
     # Patch 2: Disable art_api C module for API 36 (causes ToReflectedMethod crashes)
     old2 = '[1,e.ifields,e.methods,e.sfields,e.copiedMethodsOffset,n.size,n.offset.accessFlags,r.size,r.offset.accessFlags,4294967295]'
